@@ -1,0 +1,8 @@
+flake8
+pyproject-flake8
+flake8-docstrings
+flake8-rst-docstrings
+mypy
+isort
+black
+pytest
