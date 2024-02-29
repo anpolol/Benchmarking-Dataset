@@ -65,12 +65,12 @@ for loss in [VERSE_Adj, VERSE_PPR, VERSE_SR, DeepWalk, Node2Vec, APP, HOPE_AA, H
 
                     columns = ["Loss name", "Conv", "l", "f", "cl", "asp", "ad", "loss value"] + list(
                         study.trials[0].params.keys())
-                    df = pd.DataFrame(columns=columns)
-                    for trial in study.trials:
-                        row = [loss_name, conv, l, f, cl, asp, ad, trial.values[0]] + list(trial.params.values())
-                        to_append = pd.Series(row, df.columns)
-                        df = df.append(to_append, ignore_index=True)
-                    df.to_csv('../data_help/' + str(loss_name) + '_' + str(conv) + '_' + str(name) + '.csv')
+                    #df = pd.DataFrame(columns=columns)
+                    #for trial in study.trials:
+                     #   row = [loss_name, conv, l, f, cl, asp, ad, trial.values[0]] + list(trial.params.values())
+                      #  to_append = pd.Series(row, df.columns)
+                       # df = df.append(to_append, ignore_index=True)
+                    #df.to_csv('../data_help/' + str(loss_name) + '_' + str(conv) + '_' + str(name) + '.csv')
 
                     loss_trgt = {key: best_values[key] for key in loss if
                                  isinstance(loss[key], list) and key in best_values}
