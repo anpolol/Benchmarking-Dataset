@@ -1,6 +1,7 @@
 import collections
 
 import torch
+from torch.nn import Linear, Embedding
 import torch.nn.functional as F
 from torch_geometric.nn import ChebConv, GATConv, GCNConv, SAGEConv, SGConv
 
@@ -13,13 +14,15 @@ class Net(torch.nn.Module):
         loss_function,
         mode="unsupervised",
         conv="GCN",
+            RNWE_layer=None,
         hidden_layer=64,
         out_layer=128,
         dropout=0,
         num_layers=2,
         hidden_layer_for_classifier=128,
         number_of_layers_for_classifier=2,
-        heads=1
+        heads=1,
+
     ):
         super(Net, self).__init__()
         self.mode = mode
@@ -37,6 +40,7 @@ class Net(torch.nn.Module):
         self.history = []
         out_channels = self.out_layer
         self.heads = heads
+        self.RNWE_layer = RNWE_layer if RNWE_layer else len(self.data.x)
 
         if self.mode == "unsupervised":
             if loss_function["loss var"] == "Random Walks":
@@ -49,6 +53,11 @@ class Net(torch.nn.Module):
                 self.loss = self.lossLaplacianEigenMaps
             elif loss_function["loss var"] == "Force2Vec":
                 self.loss = self.lossTdistribution
+            elif loss_function["loss var"] == "GraRep":
+                self.loss = self.lossGraRep
+            elif loss_function["loss var"] == "RNWE":
+                self.loss = self.lossRNWE
+                self.layer_rnwe = Linear(self.out_layer,self.data.num_nodes)
 
         elif self.mode == "supervised":
 
@@ -93,6 +102,8 @@ class Net(torch.nn.Module):
                 for i in range(1, self.num_layers - 1):
                     self.convs.append(GATConv(self.heads*self.hidden_layer, self.hidden_layer,heads=self.heads))
                 self.convs.append(GATConv(self.heads*self.hidden_layer, out_channels,heads=self.heads))
+        elif self.conv == "transductive":
+            self.convs.append(Embedding(len(self.data.x), out_channels, max_norm=True))
 
         self.reset_parameters()
 
@@ -104,18 +115,23 @@ class Net(torch.nn.Module):
 
         for i, (edge_index, _, size) in enumerate(adjs):
             x_target = x[: size[1]]  # Target nodes are always placed first.
-           # print(size)
             x = self.convs[i]((x, x_target), edge_index)
             if i != self.num_layers - 1:
                 x = F.relu(x)
                 x = F.dropout(x, p=self.dropout, training=self.training)
         if self.mode == "unsupervised":
-            return x
+            if self.loss_function["loss var"] == 'RNWE':
+                return torch.sigmoid(self.layer_rnwe(x)), x
+            else:
+                return x
+
         elif self.mode == "supervised":
             for j in range(self.number_of_layers_for_classifier):
                 x = self.classifier[j](x)
                 x = F.relu(x)
             return x.log_softmax(dim=1)
+
+
 
     def inference(self, data, dp=0):
 
@@ -125,13 +141,25 @@ class Net(torch.nn.Module):
             if i != self.num_layers - 1:
                 x = x.relu()
                 x = F.dropout(x, p=dp, training=self.training)
-        if self.mode == "unsupervised":  # ONLY FOR LINK PREDICTION
-            return x
+        if self.mode == "unsupervised":
+            if self.loss_function["loss var"] == 'RNWE':
+                return torch.sigmoid(self.layer_rnwe(x)), x
+            else:
+                return x
         elif self.mode == "supervised":
             for j in range(self.number_of_layers_for_classifier):
                 x = self.classifier[j](x)
                 x = F.relu(x)
             return x.log_softmax(dim=-1)
+    def tr_inference(self, data, dp=0):
+
+        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_attr
+        x = self.convs[0](torch.LongTensor(range(len(x))))
+        if self.loss_function["loss var"] == 'RNWE':
+            return torch.sigmoid(self.layer_rnwe(x)), x
+        else:
+            return x
+
 
     def lossRandomWalks(self, out, PosNegSamples):
         (pos_rw, neg_rw) = PosNegSamples
@@ -185,23 +213,61 @@ class Net(torch.nn.Module):
         dot = ((h_start * h_rest).sum(dim=-1)).view(-1)
 
         if self.loss_function["Name"] == "LINE":
-            pos_loss = -2 * (weight * torch.nn.LogSigmoid()((-1) * dot)).mean()
+            pos_loss = -2 * (weight * torch.nn.LogSigmoid()(dot)).mean()
 
         elif self.loss_function["Name"].split("_")[0] == "VERSE" or self.loss_function["Name"] == "APP":
-            pos_loss = -(weight * torch.nn.LogSigmoid()((-1) * dot)).mean()
+            pos_loss = -(weight * torch.nn.LogSigmoid()(dot)).mean()
 
         return pos_loss + neg_loss
 
+    def lossGraRep(self, out, PosNegSamples):
+        (pos_rw, neg_rw) = PosNegSamples
+        pos_rw = pos_rw.to(self.device)
+        neg_rw = neg_rw.to(self.device)
+
+       # print(neg_rw)
+        start, rest = neg_rw[:, 0].type(torch.LongTensor), neg_rw[:, 1:].type(torch.LongTensor).contiguous()
+        indices = start != rest.view(-1)
+        start = start[indices]
+        h_start = out[start].view(start.shape[0], 1, self.out_layer)
+        rest = rest[indices]
+        # print('neg',start,rest)
+
+        h_rest = out[rest].view(rest.shape[0], -1, self.out_layer)
+
+        dot = (h_start * h_rest).sum(dim=-1).view(-1)
+        lmbda = self.loss_function["lmbda"]
+        neg_loss = -lmbda*(torch.nn.LogSigmoid()((-1) * dot)).mean()/len(self.data.x)
+
+        # Positive loss.
+        start, rest = pos_rw[:, 0].type(torch.LongTensor), pos_rw[:, 1].type(torch.LongTensor).contiguous()
+
+        weight = pos_rw[:, 2]
+        h_start = out[start].view(pos_rw.size(0), 1, self.out_layer)
+
+
+        h_rest = out[rest.view(-1)].view(pos_rw.size(0), -1, self.out_layer)
+
+        dot = ((h_start * h_rest).sum(dim=-1)).view(-1)
+
+        pos_loss = - (weight * torch.nn.LogSigmoid()( dot)).mean()
+
+        return pos_loss + neg_loss
     def lossFactorization(self, out, S, **kwargs):
         S = S.to(self.device)
         lmbda = self.loss_function["lmbda"]
-        loss = 0.5 * sum(sum((S - torch.matmul(out, out.t())) * (S - torch.matmul(out, out.t())))) + 0.5 * lmbda * sum(
-            sum(out * out)
-        )
+        if self.loss_function["Name"] == "GraphFactorization":
+            Y_product = torch.mm(out, out.t())
+            loss = torch.sum((1 - Y_product) * S) + 0.5 * lmbda * sum(sum(out * out))
+        else:
+            loss = 0.5 * sum(
+                sum((S - torch.matmul(out, out.t())) * (S - torch.matmul(out, out.t())))) + 0.5 * lmbda * sum(
+                sum(out * out)
+            )
         return loss
 
     def lossLaplacianEigenMaps(self, out, A):
-        dd = torch.device("cuda", 0)
+        dd = torch.device("cpu")
         # dd=torch.device('cpu')
         L = (torch.diag(sum(A)) - A).type(torch.FloatTensor).to(dd)
         out_tr = out.t().to(dd)
@@ -231,23 +297,8 @@ class Net(torch.nn.Module):
         # h_rest=torch.nn.functional.normalize(h_rest, p=2.0, dim = -1)
         # print(h_start,h_rest)
         t_squared = ((h_start - h_rest) * (h_start - h_rest)).mean(dim=-1).view(-1)
+        neg_loss = (-torch.log((t_squared / (1 + t_squared)))).mean()
 
-        # if len((t_squared==0).nonzero())>0:
-        #   print('tsquared')
-        #    print(start[(t_squared==0).nonzero()],rest[(t_squared==0).nonzero()])
-
-        # idx=(torch.log(t_squared)==torch.tensor((-1)*np.inf)).nonzero()
-        # self.history.append(h_start)
-        # if len(idx)>0:
-        # print('error',len(idx),h_start[idx])
-        #  for i in range(len(self.history)):
-        #     print(self.history[i][idx])
-
-        # neg_loss = -(torch.log(torch.nn.Softsign()(t_squared))).mean()
-        neg_loss = (-torch.log((t_squared / (1 + t_squared)) + eps)).mean()
-        # neg_loss = (-torch.log(t_squared) + torch.log(t_squared+1)).mean()
-        # print(torch.sum(t_squared==0), torch.log(t_squared+1).sum())
-        # print('neg',neg_loss)
         # Positive loss.
         start, rest = pos_rw[:, 0].type(torch.LongTensor), pos_rw[:, 1].type(torch.LongTensor).contiguous()
         weight = pos_rw[:, 2]
@@ -256,8 +307,47 @@ class Net(torch.nn.Module):
         # h_start=torch.nn.functional.normalize(h_start, p=2.0, dim = -1)
         # h_rest=torch.nn.functional.normalize(h_rest, p=2.0, dim = -1)
         t_squared = ((h_start - h_rest) * (h_start - h_rest)).sum(dim=-1).view(-1)
-        pos_loss = -(torch.log(1 / (1 + t_squared))).mean()
+        pos_loss = (torch.log(1 + t_squared)).mean()
         # print('losses',pos_loss,neg_loss)
+
+        return pos_loss + neg_loss
+
+
+    def lossRNWE(self, out_all, PosNegSamples):
+        Phi, out = out_all
+        lmbda = self.loss_function["lmbda"]
+        gamma = self.loss_function["gamma"]
+        eps = 10e-6
+        (pos_rw, neg_rw) = PosNegSamples
+
+        pos_rw = pos_rw.to(self.device)
+        neg_rw = neg_rw.to(self.device)
+        start, rest = neg_rw[:, 0].type(torch.LongTensor), neg_rw[:, 1:].type(torch.LongTensor).contiguous()
+        #indices = start != rest.view(-1)
+        #start = start[indices]
+        h_start = out[start].view(start.shape[0], 1, self.out_layer)
+        rest = rest.view(-1)
+        rest = rest#[indices]
+        h_rest = out[rest].view(neg_rw.size(0), -1, self.out_layer)
+        sim = (0.5)*(1+(h_start * h_rest).sum(dim=-1)/(torch.norm(h_start)*torch.norm(h_rest)))
+        rows_selected = Phi[neg_rw[:, 0]]
+        # Теперь для каждой строки извлекаем элементы, используя индексы из pos_rw[:, 1:]
+        Phi_extended = torch.zeros((neg_rw.shape[0], neg_rw.shape[1] - 1))
+        for i in range(neg_rw.shape[1] - 1):
+            Phi_extended[:, i] = rows_selected[torch.arange(rows_selected.shape[0]), neg_rw[:, i + 1]]
+        ones_tensor=torch.ones(sim.shape[0],sim.shape[1])
+        neg_loss = - (gamma*torch.log(ones_tensor-sim) + lmbda*torch.log(ones_tensor-Phi_extended)).sum()
+
+        start, rest = pos_rw[:, 0].type(torch.LongTensor), pos_rw[:, 1:].type(torch.LongTensor).contiguous()
+        h_start = out[start].view(pos_rw.size(0), 1, self.out_layer)
+        h_rest = out[rest.view(-1)].view(pos_rw.size(0), -1, self.out_layer)
+        sim = (0.5)*(1+(h_start * h_rest).sum(dim=-1)/(torch.norm(h_start)*torch.norm(h_rest)))
+        rows_selected = Phi[pos_rw[:, 0]]
+        # Теперь для каждой строки извлекаем элементы, используя индексы из pos_rw[:, 1:]
+        Phi_extended = torch.zeros((pos_rw.shape[0], pos_rw.shape[1] - 1))
+        for i in range(pos_rw.shape[1] - 1):
+            Phi_extended[:, i] = rows_selected[torch.arange(rows_selected.shape[0]), pos_rw[:, i + 1]]
+        pos_loss = -(gamma*torch.log(sim) + lmbda*torch.log(Phi_extended)).sum()
         return pos_loss + neg_loss
 
     # loss function for supervised mode

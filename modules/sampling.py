@@ -4,6 +4,7 @@ import math
 import os
 import pickle
 from datetime import datetime
+import random
 
 import numpy as np
 import torch
@@ -31,8 +32,6 @@ class Sampler:
 
     def edge_index_to_adj_train(self, batch):
         x_new = torch.sort(batch).values
-        d_2 = datetime.now()
-
         x_new = x_new.tolist()
         mapping = {}
         i=0
@@ -113,7 +112,6 @@ class SamplerRandomWalk(SamplerWithNegSamples):
         return neg_batch
 
     def pos_sample(self, batch,postfix):
-
         name_of_samples = (
                 self.datasetname
                 + "_"
@@ -144,7 +142,6 @@ class SamplerRandomWalk(SamplerWithNegSamples):
                 if value not in mapping:
                     mapping[value] = i
                     i += 1
-
             a, _ = subgraph(batch.to(self.device), self.data.edge_index)
             row, col = a.to('cpu')
            # rowli = row.tolist()
@@ -169,9 +166,9 @@ class SamplerRandomWalk(SamplerWithNegSamples):
             rowptr, col, _ = adj.csr()
             d2 = datetime.now()
             start = batch.repeat(self.walks_per_node).to(self.device)
-            print(RW)
+            print('Random Walk')
             rw = RW(rowptr, col, start, self.walk_length, self.p, self.q)
-
+            print('Random Walk2')
             if not isinstance(rw, torch.Tensor):
                 rw = rw[0]
             walks = []
@@ -187,7 +184,6 @@ class SamplerRandomWalk(SamplerWithNegSamples):
         #   with open('Chameleon_20_5_20_1_1.pickle','rb') as f:
         #      pos_samples = pickle.load(f)
         # print('nope')
-
         return pos_samples
 
 
@@ -223,7 +219,24 @@ class SamplerContextMatrix(SamplerWithNegSamples):
             else:
                 Adj,mapping = self.edge_index_to_adj_train(batch)
                 Adj=Adj.type(torch.FloatTensor)
-                A = (Adj / sum(Adj)).t()
+                A = (Adj / sum(Adj))
+                #A[torch.isinf(A)] = 0
+                #A[torch.isnan(A)] = 0
+                pos_batch = self.convert_to_samples(batch, mapping, A)
+                with open(name, "wb") as f:
+                    pickle.dump(pos_batch, f)
+        elif self.loss["C"] == "Adj" and self.loss["Name"] == "GraRep":
+            name = f"{self.help_dir}/pos_samples_GraRep_" + self.datasetname+ '_' +str(postfix) + ".pickle"
+            if os.path.exists(name):
+                with open(name, "rb") as f:
+                    pos_batch = pickle.load(f)
+            else:
+                Adj,mapping = self.edge_index_to_adj_train(batch)
+                Adj=Adj.type(torch.FloatTensor)
+                A = Adj
+                for _ in range(5):
+                    A += A * Adj
+
                 A[torch.isinf(A)] = 0
                 A[torch.isnan(A)] = 0
                 pos_batch = self.convert_to_samples(batch, mapping, A)
@@ -251,6 +264,7 @@ class SamplerContextMatrix(SamplerWithNegSamples):
                 mask = torch.cat(mask)  # O((1-sqrt(c)) *t^2)
                 mask_new = 1 - mask
                 A = self.find_sim_rank_for_batch_torch(batch, ASparse, self.device, mask, mask_new, r)
+
                 with open(SimRankName, "wb") as f:
                     pickle.dump(A, f)
             samples_name = f"{self.help_dir}/samples_simrank_" + self.datasetname + '_' +str(postfix)+ ".pickle"
@@ -260,7 +274,16 @@ class SamplerContextMatrix(SamplerWithNegSamples):
                     pos_batch = pickle.load(f)
 
             else:
-                pos_batch = self.convert_to_samples(batch, A)
+                pos_batch = []
+                batch_l = batch.tolist()
+                for x in batch_l:
+                    # print('{}/{}'.format(x,len(batch_l)))
+                    for j in batch_l:
+                        # print(x,j,'in',len(batch_l))
+                        if A[int(x)][int(j)] != torch.tensor(0):
+                            pos_batch.append([int(x), int(j), A[x][j]])
+
+                pos_batch = torch.tensor(pos_batch)
                 with open(samples_name, "wb") as f:
                     pickle.dump(pos_batch, f)
 
@@ -273,9 +296,8 @@ class SamplerContextMatrix(SamplerWithNegSamples):
             else:
                 Adg, mapping = self.edge_index_to_adj_train(batch)
                 Adg = Adg.type(torch.FloatTensor)
-                invD = torch.diag(1 / sum(Adg.t()))
-                invD[torch.isinf(invD)] = 0
-                A = (1 - alpha) * torch.inverse(torch.diag(torch.ones(len(Adg))) - alpha * torch.matmul(invD, Adg))
+                #invD[torch.isinf(invD)] = 0
+                A = (1 - alpha) * torch.inverse(torch.diag(torch.ones(len(Adg))) - alpha * Adg/Adg.sum(dim=0))
                 pos_batch = self.convert_to_samples(batch, mapping, A)
                 with open(name_of_file, "wb") as f:
                     pickle.dump(pos_batch, f)
@@ -356,33 +378,34 @@ class SamplerFactorization(Sampler):
                 A = A.type(torch.FloatTensor).to(self.device)
                 C = torch.matmul(A, A)
             elif self.loss["C"] == "AA":
-                if True:
-                    D = torch.diag(1 / (sum(A) + sum(A.t())))
-                    A = A.type(torch.FloatTensor)
-                    D[torch.isinf(D)] = 0
-                    D[torch.isnan(D)] = 0
-                    C = torch.matmul(torch.matmul(A, D), A)
+                D = torch.diag(1 / (sum(A) + sum(A.t())))
+                A = A.type(torch.FloatTensor)
+              #  D[torch.isinf(D)] = 0
+               # D[torch.isnan(D)] = 0
+                C = torch.matmul(torch.matmul(A, D), A)
 
             elif self.loss["C"] == "Katz":
 
                 A = A.type(torch.FloatTensor)
-                A[torch.isinf(A)] = 0
-                A[torch.isnan(A)] = 0
+               # A[torch.isinf(A)] = 0
+               # A[torch.isnan(A)] = 0
                 betta = self.loss["betta"]
                 I = torch.diag(torch.ones(len(A)))
                 # print('IAB',I,A,betta)
                 # print('I-BA',I-betta*A)
-                inv = torch.cholesky_inverse(I - betta * A)
+                inv = torch.linalg.inv(I - betta * A)
+                vals=torch.linalg.eigvals(A)
                 # print(sum(sum(inv)),sum(inv),inv)
                 C = betta * torch.matmul(inv, A)
             elif self.loss["C"] == "RPR":
                 alpha = self.loss["alpha"]
-                if True:
-                    A = A.type(torch.FloatTensor)
-                    invD = torch.diag(1 / sum(A.t()))
-                    invD[torch.isinf(invD)] = 0
-                    # print(torch.inverse(torch.diag(torch.ones(len(A))))
-                    C = (1 - alpha) * torch.inverse(torch.diag(torch.ones(len(A))) - alpha * torch.matmul(invD, A))
+                A = A.type(torch.FloatTensor)
+                N = A.sum(dim=0)
+                # Создаем матрицу P, где каждый элемент A_ij, равный 1, заменяется на 1/N(j)
+                P = A / N
+                #invD[torch.isinf(invD)] = 0
+                # print(torch.inverse(torch.diag(torch.ones(len(A))))
+                C = (1 - alpha) * torch.inverse(torch.diag(torch.ones(len(A))) - alpha * P)
 
             return C
         else:
@@ -499,3 +522,128 @@ class SamplerAPP(SamplerWithNegSamples):
                         else:
                             dict_data[(int(seg[0][0]), int(pos_sample))] = 1
         return dict_data
+
+class SamplerRNWE(Sampler):
+    def __init__(self, datasetname, data, device, mask, loss_info, **kwargs):
+        Sampler.__init__(self, datasetname, data, device, mask, loss_info, **kwargs)
+
+        self.loss = loss_info
+        self.walk_length = self.loss["walk_length"]
+        self.alpha = self.loss["alpha"]
+        self.walks_per_node = self.loss["walks_per_node"]
+
+    def _restart_random_walk(self, start_nodes, adj, walk_length = 0, alpha=0.1):
+        num_nodes = adj.shape[0]
+        normalized_adj_matrix = self.normalize_adjacency_matrix(adj)
+        walks = torch.empty((len(start_nodes), walk_length), dtype=torch.long)
+        current_positions = start_nodes.clone().detach() #torch.tensor(start_nodes, dtype=torch.long)
+        walks[:, 0] = current_positions
+
+        for step in range(1, walk_length):
+            # Определение, кто из узлов будет перемещаться дальше
+            moves = torch.rand(len(start_nodes)) > alpha
+            for i, move in enumerate(moves):
+                if move:
+                    # Выбор следующей вершины с учетом вероятностей перехода
+                    current_node = current_positions[i]
+                    probabilities = normalized_adj_matrix[current_node]
+                    next_node = torch.multinomial(probabilities, 1).item()
+                    current_positions[i] = next_node
+                else:
+                    # Рестарт к начальной вершине
+                    current_positions[i] = start_nodes[i]
+
+            walks[:, step] = current_positions
+
+        return walks # input(center_node), targets(context_nodes), neg_targets(neg_nodes)
+    def normalize_adjacency_matrix(self, adj_matrix):
+        # Преобразование типов для поддержки torch.multinomial
+        adj_matrix_float = adj_matrix.float()
+        adj_matrix_float += 1e-9 # для изолированных вершин чтоб не было инф
+        # Нормализация строк матрицы смежности с добавлением небольшой константы к сумме для избежания деления на 0
+        row_sums = adj_matrix_float.sum(dim=1, keepdim=True) + 1e-6  # Добавляем небольшую константу к суммам строк
+        normalized_adj_matrix = adj_matrix_float / row_sums
+        return normalized_adj_matrix
+    def neg_sample(self, walks,postfix): #это оч долго
+        name_of_samples = (
+                self.datasetname
+                + "_"
+                + str(self.walk_length)
+                + "_"
+                + str(self.walks_per_node)
+                + '_'
+                + str(self.alpha)
+                + '_'
+                + str(postfix)
+                + str('_negative')
+                + ".pickle"
+        )
+        if os.path.exists(name_of_samples):
+            with open(name_of_samples, "rb") as f:
+                negative_samples = pickle.load(f)
+        else:
+            unique_nodes_per_walk = walks.unique(dim=1)
+            # Инициализация матрицы негативных примеров
+            negative_samples = torch.empty_like(walks)
+            num_nodes = len(set(walks[:,0].tolist()))
+            for i in range(len(walks)):
+                # Доступные вершины для негативных примеров
+                available_nodes = torch.tensor([node for node in range(num_nodes) if node not in unique_nodes_per_walk[i]],
+                                               dtype=torch.long)
+
+                # Генерация негативных примеров
+                for j in range(1, walks.shape[1]):  # Пропускаем первый столбец, так как он для стартовых вершин
+                    negative_samples[i, j] = available_nodes[torch.randint(0, len(available_nodes), (1,))]
+
+            # Установка стартовых вершин на первые позиции
+            negative_samples[:, 0] = walks[:,0]
+            with open(name_of_samples,'wb') as f:
+                pickle.dump(negative_samples,f)
+        return negative_samples
+
+    def pos_sample(self, batch, postfix):
+        name_of_samples = (
+                self.datasetname
+                + "_"
+                + str(self.walk_length)
+                + "_"
+                + str(self.walks_per_node)
+                + '_'
+                +  str(self.alpha)
+                + '_'
+                + str(postfix)
+                + ".pickle"
+        )
+        if os.path.exists(name_of_samples):
+            with open(name_of_samples, "rb") as f:
+                pos_samples = pickle.load(f)
+        else:
+            len_batch = len(batch)
+            x_new = batch.tolist()
+            mapping = {}
+            i = 0
+            for value in (x_new):
+                if value not in mapping:
+                    mapping[value] = i
+                    i += 1
+
+            start = batch.repeat(self.walks_per_node)
+            new_start = torch.empty_like(start)
+            for key, value in mapping.items():
+                new_start[start == key] = value
+
+            adj, _ = self.edge_index_to_adj_train(batch)
+            pos_samples = self._restart_random_walk(new_start, adj, self.walk_length, self.alpha)
+            #pos_samples = torch.cat(walks)  # .to(self.device)
+           # print('pos_samples',pos_samples)
+            with open(name_of_samples,'wb') as f:
+                pickle.dump(pos_samples,f)
+
+        return pos_samples
+
+    def sample(self, batch,postfix):
+        if not isinstance(batch, torch.Tensor):
+            batch = torch.tensor(batch, dtype=torch.long).to(self.device)
+        pos_samples = self.pos_sample(batch,postfix)
+        neg_samples = self.neg_sample(pos_samples,postfix)
+        return (pos_samples, neg_samples)

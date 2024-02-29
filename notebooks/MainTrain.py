@@ -15,6 +15,7 @@ import torch_geometric.transforms as T
 from torch_geometric.loader import NeighborSampler
 import optuna
 from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+from matplotlib import pyplot as plt
 
 synthetic = True
 
@@ -132,10 +133,18 @@ class Main:
                 loss = model.loss(out[mask], self.samples)
                 # print('loss',loss)
                 total_loss += loss
-
+            elif model.conv=='transductive':
+                arr = torch.nonzero(mask == True)
+                indices_of_train_data = ([item for sublist in arr for item in sublist])
+                # print('before',data.x)
+                out = model.tr_inference(data.to(self.device), dp=dropout)
+                # print('after',out, sum(sum(out)))
+                samples = self.sampling(Sampler, epoch, indices_of_train_data, loss, postfix)
+                loss = model.loss(out, self.samples)
+                # print('loss',loss)
+                total_loss += loss
             else:
                 for batch_size, n_id, adjs in train_loader:
-
                     if len(train_loader.sizes) == 1:
                         adjs = [adjs]
                     adjs = [adj.to(self.device) for adj in adjs]
@@ -144,8 +153,10 @@ class Main:
                     loss = model.loss(out, self.samples)  # pos_batch.to(device), neg_batch.to(device))
                     total_loss += loss
 
+
             total_loss.backward()
             optimizer.step()
+
             return total_loss / len(train_loader), out
 
     @torch.no_grad()
@@ -156,12 +167,9 @@ class Main:
             if model.conv == 'GCN':
                 arr = torch.nonzero(self.test_mask == True)
                 indices_of_train_data = ([item for sublist in arr for item in sublist])
-                # print('before',data.x)
                 out = model.inference(data.to(self.device), dp=0)
-                # print('after',out, sum(sum(out)))
                 self.sampling(Sampler, epoch, indices_of_train_data, loss, postfix='test')
                 loss = model.loss(out[self.test_mask], self.samples)
-                # print('loss',loss)
                 total_loss += loss
             else:
                 for batch_size, n_id, adjs in test_loader:
@@ -176,7 +184,22 @@ class Main:
                     total_loss += loss
 
             return total_loss / len(test_loader)
-
+    def selfCluster(self, M):
+        n, d = M.shape
+        normalized_emb = M/torch.linalg.norm(M, 2, axis=1, keepdims=True)
+        norm = torch.linalg.norm(torch.matmul(normalized_emb, normalized_emb.T),'fro')
+        return ((d*norm - n*(d+n-1))/((d-1)*(n-1)*n)).item()
+    def condNumber(self,M):
+        S = torch.linalg.svdvals(M)
+        return (S.min() / S.max()).item()
+    def stableRank(self,M):
+        return (torch.linalg.norm(M, 'fro') / (torch.linalg.norm(M, 2) ** 2)).item()
+    def coherence(self, M):
+        U, _, _ = torch.svd(M)
+        n, r = U.shape
+        coherence_values = torch.norm(U, dim=1) ** 2
+        mu_0 = (n / r) * torch.max(coherence_values)
+        return mu_0.item()
     def run(self, params):
         hidden_layer = params['hidden_layer']
         out_layer = params['out_layer']
@@ -192,22 +215,23 @@ class Main:
         # hidden_layer=64,out_layer=128,dropout=0.0,size=1,learning_rate=0.001,c=100
 
         self.data.edge_index = self.data.edge_index.type(torch.LongTensor)
-        ns = NegativeSampler(data=self.data)  # это для того чтоб тестовые негативные примеры не включали
+        if self.Conv != 'transductive':
+            # ребра делю на тренировочные и тестовые просто чтоб linkprediction посчитать
+            ns = NegativeSampler(data=self.data)  # это для того чтоб тестовые негативные примеры не включали
+            all_edges = self.data.edge_index.T.tolist()
+            train_edges = []
+            test_edges = []
+            indices_train_edges = random.sample(range(len(all_edges)), int(len(all_edges) * 0.8))
+            for i, edge in enumerate(all_edges):
+                if i in indices_train_edges:
+                    train_edges.append(edge)
+                else:
+                    test_edges.append(edge)
 
-        all_edges = self.data.edge_index.T.tolist()
-        train_edges = []
-        test_edges = []
-        indices_train_edges = random.sample(range(len(all_edges)), int(len(all_edges) * 0.8))
-        for i, edge in enumerate(all_edges):
-            if i in indices_train_edges:
-                train_edges.append(edge)
-            else:
-                test_edges.append(edge)
-
-        self.data.edge_index = torch.LongTensor(train_edges).T
+            self.data.edge_index = torch.LongTensor(train_edges).T
 
         train_loader = NeighborSampler(self.data.edge_index, node_idx=torch.BoolTensor([True] * len(self.data.x)),
-                                       batch_size=int(len(self.data.x)), sizes=[-1] * size)
+                                   batch_size=int(len(self.data.x)), sizes=[-1] * size)
 
         Sampler = self.loss["Sampler"]
         LossSampler = Sampler(self.datasetname, self.data, device=self.device,
@@ -216,43 +240,50 @@ class Main:
                     hidden_layer=hidden_layer, out_layer=out_layer, num_layers=(size), dropout=dropout)
         model.to(self.device)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=0.1)
         # scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, threshold=0.01, threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08, verbose=False)
-        for epoch in range(100):
-            loss, out = self.train(model, self.data, optimizer, LossSampler, train_loader, dropout, epoch, self.loss,
-                                   postfix='trainLP')
 
-        np.save('../data_help/' + str(self.datasetname) + '_' + str(self.loss['Name']) + '_emb.npy',
-                out.detach().cpu().numpy())
+        if model.conv=='transductive':
+            losses = []
+            for epoch in range(500):
+                loss, out = self.train(model, self.data, optimizer, LossSampler, train_loader, dropout, epoch,
+                                       self.loss,
+                                       postfix='full')
+                losses.append(loss.item())
+            plt.plot(losses)
+            plt.show()
+            print('main loss result',loss)
+            return self.coherence(out), self.stableRank(out), self.condNumber(out), self.selfCluster(out)
+        else:
+            for epoch in range(100):
+                loss, out = self.train(model, self.data, optimizer, LossSampler, train_loader, dropout, epoch, self.loss,
+                               postfix='trainLP')
+            positive_edges = test_edges
+            ###вот отюсда доделывать
 
-        positive_edges = test_edges
-        ###вот отюсда доделывать
+            num_neg_samples_test = int(len(positive_edges) / len(self.data.x))
+            num_neg_samples_test = num_neg_samples_test if num_neg_samples_test > 0 else 1
 
-        num_neg_samples_test = int(len(positive_edges) / len(self.data.x))
-        print('first num neg samples test', (num_neg_samples_test))
-        num_neg_samples_test = num_neg_samples_test if num_neg_samples_test > 0 else 1
+            neg_samples_test = ns.negative_sampling(torch.LongTensor(list(range(len(self.data.x)))),
+                                                    num_negative_samples=num_neg_samples_test)
 
-        neg_samples_test = ns.negative_sampling(torch.LongTensor(list(range(len(self.data.x)))),
-                                                num_negative_samples=num_neg_samples_test)
-        print('num_negative_samples_test', num_neg_samples_test)
-        print('len', len(positive_edges), len(neg_samples_test))
 
-        if (num_neg_samples_test == 1) and (len(neg_samples_test) > len(positive_edges)):
-            ind = torch.randperm(len(positive_edges))
-            neg_samples_test = neg_samples_test[ind]
-        emb_norm = torch.nn.functional.normalize(torch.tensor(out.detach().cpu()))
+            if (num_neg_samples_test == 1) and (len(neg_samples_test) > len(positive_edges)):
+                ind = torch.randperm(len(positive_edges))
+                neg_samples_test = neg_samples_test[ind]
+            emb_norm = torch.nn.functional.normalize(torch.tensor(out.detach().cpu()))
 
-        pred_test = []
-        for edge in positive_edges:
-            pred_test.append((torch.dot(emb_norm[edge[0]], emb_norm[edge[1]])))
-        # print(torch.sigmoid(torch.dot(emb_norm[edge[0]],emb_norm[edge[1]])))
+            pred_test = []
+            for edge in positive_edges:
+                pred_test.append((torch.dot(emb_norm[edge[0]], emb_norm[edge[1]])))
+            # print(torch.sigmoid(torch.dot(emb_norm[edge[0]],emb_norm[edge[1]])))
 
-        for edge in neg_samples_test:
-            pred_test.append((torch.dot(emb_norm[edge[0]], emb_norm[edge[1]])))
+            for edge in neg_samples_test:
+                pred_test.append((torch.dot(emb_norm[edge[0]], emb_norm[edge[1]])))
 
-        true_test = [1] * len(positive_edges) + [0] * len(neg_samples_test)
+            true_test = [1] * len(positive_edges) + [0] * len(neg_samples_test)
 
-        return roc_auc_score(true_test, pred_test)
+            return roc_auc_score(true_test, pred_test)
 
 
 class MainOptuna(Main):
@@ -264,15 +295,8 @@ class MainOptuna(Main):
         size = trial.suggest_categorical("size of network, number of convs", [1, 2, 3])
         Conv = self.Conv
         learning_rate = trial.suggest_float("lr", 5e-3, 1e-2)
-        #   learning_rate_for_classifier =trial.suggest_float("learning_rate_for_classifier",5e-3,1e-2)
-        #  n_layers_for_classifier = trial.suggest_categorical("n_layers_for_classifier", [1,2,3])
-        # alpha_for_classifier = trial.suggest_categorical("alpha_for_classifier",  [0.001, 0.01, 0.1,0.3,0.5,0.7,0.9,1,10,20,30,100])
-        # c =trial.suggest_categorical("c",  [0.001, 0.01, 0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1,10,20,30,100])
-        # hidden_layer_for_classifier = trial.suggest_categorical("hidden_layer_for_classifier", [32,64,128,256])
-        # варьируем параметры
         loss_to_train = {}
         for name in self.loss:
-
             if type(self.loss[name]) == list:
                 if len(self.loss[name]) == 3:
                     var = trial.suggest_int(name, self.loss[name][0], self.loss[name][1], step=self.loss[name][2])
@@ -297,7 +321,7 @@ class MainOptuna(Main):
 
         Sampler = loss_to_train["Sampler"]
         model = Net(dataset=self.data, mode=self.mode, conv=Conv, loss_function=loss_to_train, device=self.device,
-                    hidden_layer=hidden_layer, out_layer=out_layer, num_layers=size, dropout=dropout)
+                    hidden_layer=hidden_layer, out_layer=out_layer, num_layers=size, dropout=dropout,RNWE_layer=int(sum(self.train_mask)))
         self.data.edge_index = self.data.edge_index.type(torch.LongTensor)
 
         train_loader = NeighborSampler(self.data.edge_index, batch_size=int(sum(self.train_mask)),
@@ -311,13 +335,29 @@ class MainOptuna(Main):
         model.to(self.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
 
+        losses = []
         for epoch in range(50):
-            loss, _ = self.train(model, self.data, optimizer, LossSampler, train_loader, dropout, epoch, loss_to_train,
+
+            if model.conv=='transductive':
+                loss, out = self.train(model, self.data, optimizer, LossSampler, train_loader, dropout, epoch,
+                                     loss_to_train,
+                                     postfix='full')
+                losses.append(loss.item())
+
+            else:
+                loss, _ = self.train(model, self.data, optimizer, LossSampler, train_loader, dropout, epoch, loss_to_train,
                                  postfix='train')
-        loss_test = self.test(model=model, data=self.data, epoch=0, test_loader=test_loader, Sampler=LossSamplerTest,
+        plt.plot(losses)
+        plt.show()
+        if model.conv=='transductive':
+            print('result loss', loss)
+            trial.report(loss, epoch)
+            return loss
+        else:
+            loss_test = self.test(model=model, data=self.data, epoch=0, test_loader=test_loader, Sampler=LossSamplerTest,
                               loss=loss_to_train)
-        trial.report(loss_test, epoch)
-        return loss_test
+            trial.report(loss_test, epoch)
+            return loss_test
 
     def run(self, number_of_trials):
         study = optuna.create_study(direction="minimize",
